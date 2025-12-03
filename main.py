@@ -1,144 +1,116 @@
 import logging
-import requests
 import os
-from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 from flask import Flask
 from threading import Thread
 
 # --- CONFIGURATION ---
-# On Render, these values come from "Environment Variables".
-# Locally, you can replace the second argument with your actual strings if testing manually.
+# These read the secrets from your Render Dashboard.
+# If testing locally, replace the second value with your real strings.
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8380836963:AAFFltwM5n10dIo5poWaJLL_cXXo55ZtV_Q")
 AMAZON_TAG = os.environ.get("AMAZON_TAG", "eshwardeals-21")
 
-# Set up logging
+# Set up logging to see what's happening
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-# --- ENGINE: THE SCRAPER ---
-def search_amazon(query):
-    """
-    Searches Amazon India for the query and returns a list of top 3 products.
-    """
-    base_url = "https://www.amazon.in/s?k="
-    search_term = query.replace(" ", "+")
-    url = base_url + search_term
-
-    # Fake a browser to avoid being blocked
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            return None 
-
-        soup = BeautifulSoup(response.content, "html.parser")
-        results = []
-        
-        # Target standard search result containers
-        products = soup.find_all("div", {"data-component-type": "s-search-result"})
-
-        for item in products[:3]: # Limit to top 3
-            try:
-                # Extract Title
-                h2 = item.find("h2")
-                title = h2.text.strip() if h2 else "Unknown Product"
-                
-                # Extract Link & Add Affiliate Tag
-                link_suffix = h2.a["href"]
-                if "?" in link_suffix:
-                    full_link = f"https://www.amazon.in{link_suffix}&tag={AMAZON_TAG}"
-                else:
-                    full_link = f"https://www.amazon.in{link_suffix}?tag={AMAZON_TAG}"
-
-                # Extract Price
-                price_whole = item.find("span", {"class": "a-price-whole"})
-                price = f"₹{price_whole.text}" if price_whole else "Check Price"
-
-                results.append({
-                    "title": title,
-                    "price": price,
-                    "link": full_link
-                })
-            except Exception:
-                continue 
-
-        return results
-
-    except Exception as e:
-        print(f"Error scraping Amazon: {e}")
-        return None
-
 # --- BOT HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Triggered by /start. Shows the Category Menu.
+    """
     user_first_name = update.effective_user.first_name
     
-    # REQUIRED DISCLAIMER
+    # Reset any previous category choice
+    context.user_data['category_code'] = None 
+    
     disclaimer = (
         "⚠️ *Disclaimer:* As an Amazon Associate, I earn from qualifying purchases.\n"
-        "This helps keep this bot free for you!"
     )
     
+    # Define the menu buttons (Text -> Amazon Category Code)
     keyboard = [
-        [InlineKeyboardButton("👕 Fashion", callback_data='cat_fashion'), InlineKeyboardButton("📱 Tech", callback_data='cat_tech')],
-        [InlineKeyboardButton("📚 Books", callback_data='cat_books'), InlineKeyboardButton("🏠 Home", callback_data='cat_home')]
+        [
+            InlineKeyboardButton("👕 Fashion", callback_data='apparel'), 
+            InlineKeyboardButton("📱 Tech", callback_data='electronics')
+        ],
+        [
+            InlineKeyboardButton("📚 Books", callback_data='stripbooks'), 
+            InlineKeyboardButton("🏠 Home", callback_data='kitchen')
+        ],
+        [
+            InlineKeyboardButton("🔍 Search Everything", callback_data='all')
+        ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text=f"Hi {user_first_name}! I can find the best deals for you.\n\n{disclaimer}\n\nChoose a category to start:",
+        text=f"Hi {user_first_name}! I am your Deal Finder.\n\n{disclaimer}\n\n👇 **Select a category to start:**",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Triggered when a user clicks a Category button.
+    """
     query = update.callback_query
-    await query.answer()
-    context.user_data['current_category'] = query.data
+    await query.answer() # Stop the loading animation
+    
+    selected_code = query.data
+    
+    # Save the choice. If 'all', we set it to None so the URL is generic.
+    context.user_data['category_code'] = None if selected_code == 'all' else selected_code
+    
+    # Create a nice name for display
+    name_map = {
+        'apparel': 'Fashion 👕',
+        'electronics': 'Electronics 📱',
+        'stripbooks': 'Books 📚',
+        'kitchen': 'Home 🏠',
+        'all': 'All Categories 🔍'
+    }
+    cat_name = name_map.get(selected_code, 'All Categories')
+
+    # Confirm the selection
     await query.edit_message_text(
-        text=f"Selected Category: **{query.data}**\n\nNow type a keyword (e.g., 'iPhone 13' or 'Running shoes').",
+        text=f"✅ Category set to: **{cat_name}**\n\nNow type what you are looking for (e.g., 'Running Shoes' or 'iPhone 15').",
         parse_mode='Markdown'
     )
 
 async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Triggered when the user sends text (the search query).
+    """
     user_text = update.message.text
-    chat_id = update.effective_chat.id
+    cat_code = context.user_data.get('category_code')
     
-    status_msg = await context.bot.send_message(chat_id=chat_id, text="🔍 Searching Amazon... please wait.")
+    # 1. Construct the Amazon Affiliate URL
+    # format: amazon.in/s?k=QUERY&tag=YOURTAG
+    base_url = f"https://www.amazon.in/s?k={user_text.replace(' ', '+')}&tag={AMAZON_TAG}"
+    
+    # 2. Add Category Filter if selected
+    if cat_code:
+        base_url += f"&i={cat_code}"
+    
+    # 3. Create a clickable button
+    keyboard = [[InlineKeyboardButton("🛒 View Best Deals on Amazon", url=base_url)]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # 4. Reply to the user
+    await update.message.reply_text(
+        f"🔎 **Results for:** '{user_text}'\n\n"
+        f"Click the button below to see available products, prices, and reviews on Amazon.\n",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-    products = search_amazon(user_text)
-
-    await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
-
-    if not products:
-        # Fallback link if scraping fails
-        affiliate_search_link = f"https://www.amazon.in/s?k={user_text.replace(' ', '+')}&tag={AMAZON_TAG}"
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"😕 I couldn't fetch details directly (Amazon security is strict!), but here is the direct search link:\n\n[Click here to view '{user_text}' on Amazon]({affiliate_search_link})",
-            parse_mode='Markdown'
-        )
-    else:
-        for p in products:
-            message = (
-                f"🛍️ **{p['title']}**\n"
-                f"💰 **{p['price']}**\n\n"
-                f"[View on Amazon]({p['link']})"
-            )
-            await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
-        
-        await context.bot.send_message(chat_id=chat_id, text="✨ Click the links to buy!")
-
-# --- THE FAKE WEBSITE (FOR RENDER FREE TIER) ---
+# --- FLASK KEEP-ALIVE SERVER (For Render Free Tier) ---
 app = Flask('')
 
 @app.route('/')
@@ -146,20 +118,21 @@ def home():
     return "I am alive! The bot is running."
 
 def run_http():
-    # Render assigns a random PORT via environment variable
+    # Render assigns a random PORT via env variable. Default to 8080 if not found.
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
+    # Run Flask in a background thread so it doesn't stop the bot
     t = Thread(target=run_http)
     t.start()
 
 # --- MAIN EXECUTION ---
 if __name__ == '__main__':
-    # 1. Start the fake website (Workaround for Render Web Service)
+    # 1. Start the fake website
     keep_alive()
     
-    # 2. Start the bot
+    # 2. Start the Telegram Bot
     print("Bot is starting...")
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
